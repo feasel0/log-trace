@@ -137,9 +137,15 @@ The tool consists of several components:
 3. **MessageCorrelator**: Correlates messages across logs and PCAP files using exchange IDs, message counters, and timestamps
 4. **ReportGenerator**: Generates structured markdown reports from correlated messages
 
+### Known Limitations
+
+- **PCAP Correlation**: The current implementation uses a simplified packet correlation mechanism. In a production environment, this should be enhanced with more sophisticated matching based on timestamps, IP addresses, and protocol-specific information.
+- **Exchange ID Reuse**: The tool groups messages by exchange ID. If exchange IDs are reused over time, older messages with the same exchange ID may be grouped together. Consider the time window when analyzing large log files.
+- **Error Handling**: Parsing errors are reported as warnings but don't stop execution. Missing or malformed files will result in empty sections in the report.
+
 ## Requirements
 
-- Python 3.6 or higher
+- Python 3.7 or higher
 - scapy (for PCAP parsing)
 
 ## License

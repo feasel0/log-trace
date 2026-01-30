@@ -188,7 +188,11 @@ class PcapParser:
                         dst += f":{pkt[UDP].dport}"
                 
                 # Get timestamp
-                timestamp = datetime.fromtimestamp(float(pkt.time)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                try:
+                    timestamp = datetime.fromtimestamp(float(pkt.time)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                except (ValueError, OSError) as e:
+                    # Handle invalid timestamps
+                    timestamp = "Invalid timestamp"
                 
                 packet = PcapPacket(
                     packet_number=i,
@@ -299,8 +303,8 @@ class MessageCorrelator:
             if entry.exchange_id:
                 key = entry.exchange_id
             else:
-                # Fallback to timestamp-based grouping for entries without exchange ID
-                key = f"time_{entry.timestamp}"
+                # Fallback to timestamp and line number for uniqueness
+                key = f"time_{entry.timestamp}_line_{entry.line_number}"
             
             if key not in groups:
                 groups[key] = []
