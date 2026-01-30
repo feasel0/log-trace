@@ -1,0 +1,25 @@
+2026-01-30 10:15:23,500 [INFO] Device booting up
+2026-01-30 10:15:24,200 [INFO] Network interface ready
+2026-01-30 10:15:25,800 [DEBUG] Received InvokeRequest message from controller, exchange: 0x1234, message counter: 1001
+2026-01-30 10:15:25,850 [DEBUG] Sending ACK to controller, exchange: 0x1234, message counter: 1001
+2026-01-30 10:15:26,000 [DEBUG] Processing InvokeRequest
+2026-01-30 10:15:26,120 [DEBUG] Sending InvokeResponse message to controller, exchange: 0x1234, message counter: 1002
+2026-01-30 10:15:26,220 [DEBUG] Received ACK from controller, exchange: 0x1234, message counter: 1002
+2026-01-30 10:15:30,150 [DEBUG] Received ReadRequest message from controller, exchange: 0x5678, message counter: 2001
+2026-01-30 10:15:30,200 [DEBUG] Sending ACK, exchange: 0x5678, message counter: 2001
+2026-01-30 10:15:30,400 [DEBUG] Reading attribute data
+2026-01-30 10:15:30,480 [DEBUG] Sending ReadResponse message, exchange: 0x5678, message counter: 2002
+2026-01-30 10:15:30,580 [DEBUG] Received ACK from controller, exchange: 0x5678, message counter: 2002
+2026-01-30 10:15:35,050 [DEBUG] Received WriteRequest message from controller, exchange: 0x9ABC, message counter: 3001
+2026-01-30 10:15:35,080 [DEBUG] Sending ACK to controller, exchange: 0x9ABC, message counter: 3001
+2026-01-30 10:15:35,150 [DEBUG] Writing attribute value
+2026-01-30 10:15:35,180 [DEBUG] Sending WriteResponse message, exchange: 0x9ABC, message counter: 3002
+2026-01-30 10:15:35,280 [DEBUG] Received ACK from controller, exchange: 0x9ABC, message counter: 3002
+2026-01-30 10:15:40,150 [DEBUG] Received SubscribeRequest message, exchange: 0xDEF0, message counter: 4001
+2026-01-30 10:15:40,180 [DEBUG] Sending ACK for SubscribeRequest, exchange: 0xDEF0, message counter: 4001
+2026-01-30 10:15:40,400 [DEBUG] Setting up subscription
+2026-01-30 10:15:40,480 [DEBUG] Sending SubscribeResponse message, exchange: 0xDEF0, message counter: 4002
+2026-01-30 10:15:40,580 [DEBUG] Received ACK from controller, exchange: 0xDEF0, message counter: 4002
+2026-01-30 10:15:44,950 [DEBUG] Attribute value changed, generating report
+2026-01-30 10:15:44,980 [DEBUG] Sending ReportData message to controller, exchange: 0xABCD, message counter: 5001
+2026-01-30 10:15:45,120 [DEBUG] Received ACK from controller, exchange: 0xABCD, message counter: 5001
