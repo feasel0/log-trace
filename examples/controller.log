@@ -1,0 +1,23 @@
+2026-01-30 10:15:23,456 [INFO] Matter Controller initialized
+2026-01-30 10:15:24,123 [INFO] Starting commissioning process
+2026-01-30 10:15:25,789 [DEBUG] Sending message InvokeRequest to device, exchange: 0x1234, message counter: 1001
+2026-01-30 10:15:25,890 [DEBUG] Message sent successfully
+2026-01-30 10:15:26,100 [DEBUG] Received ACK from device, exchange: 0x1234, message counter: 1001
+2026-01-30 10:15:26,150 [DEBUG] Received InvokeResponse from device, exchange: 0x1234, message counter: 1002
+2026-01-30 10:15:26,200 [DEBUG] Sending ACK to device, exchange: 0x1234, message counter: 1002
+2026-01-30 10:15:27,500 [INFO] Commissioning complete
+2026-01-30 10:15:30,100 [DEBUG] Sending ReadRequest message, exchange: 0x5678, message counter: 2001
+2026-01-30 10:15:30,300 [DEBUG] Received ACK, exchange: 0x5678, message counter: 2001
+2026-01-30 10:15:30,500 [DEBUG] Received ReadResponse message, exchange: 0x5678, message counter: 2002
+2026-01-30 10:15:30,550 [DEBUG] Sending ACK for ReadResponse, exchange: 0x5678, message counter: 2002
+2026-01-30 10:15:35,000 [DEBUG] Sending WriteRequest message to device, exchange: 0x9ABC, message counter: 3001
+2026-01-30 10:15:35,100 [DEBUG] Received ACK from device, exchange: 0x9ABC, message counter: 3001
+2026-01-30 10:15:35,200 [DEBUG] Received WriteResponse from device, exchange: 0x9ABC, message counter: 3002
+2026-01-30 10:15:35,250 [DEBUG] Sending ACK, exchange: 0x9ABC, message counter: 3002
+2026-01-30 10:15:40,000 [INFO] Starting subscription
+2026-01-30 10:15:40,100 [DEBUG] Sending SubscribeRequest message, exchange: 0xDEF0, message counter: 4001
+2026-01-30 10:15:40,200 [DEBUG] Received ACK, exchange: 0xDEF0, message counter: 4001
+2026-01-30 10:15:40,500 [DEBUG] Received SubscribeResponse message, exchange: 0xDEF0, message counter: 4002
+2026-01-30 10:15:40,550 [DEBUG] Sending ACK for subscription, exchange: 0xDEF0, message counter: 4002
+2026-01-30 10:15:45,000 [DEBUG] Received ReportData message from device, exchange: 0xABCD, message counter: 5001
+2026-01-30 10:15:45,100 [DEBUG] Sending ACK for ReportData, exchange: 0xABCD, message counter: 5001
