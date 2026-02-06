@@ -10,6 +10,8 @@ This tool reads logs from a Matter controller and DUT, correlates messages betwe
 - ACK (acknowledgment) messages
 - Related PCAP packets (when PCAP files are provided)
 
+It also produces a per-iteration **timeline** report that normalizes timestamps across controller/DUT logs and PCAPs into a single unified timeline (controller-console time).
+
 ## Features
 
 - **Log Parsing**: Extracts relevant message entries from controller and DUT logs
@@ -17,6 +19,8 @@ This tool reads logs from a Matter controller and DUT, correlates messages betwe
 - **ACK Tracking**: Identifies acknowledgment messages for each data message
 - **PCAP Integration**: Correlates log entries with network packets from PCAP files
 - **Markdown Reports**: Generates structured, human-readable reports with sections per message
+- **JSON Artifacts**: Emits machine-readable JSON outputs alongside the markdown reports
+- **Timeline (MD + JSON)**: Emits `timeline_<iteration>.md/.json` with all timestamps normalized to controller-console time
 
 ## Installation
 
@@ -46,6 +50,14 @@ python analyze_traffic.py \
     --iteration-dir logs/MatterTest/ble-wifi/<timestamp>/<testcase>/<iteration>/
 ```
 
+Artifacts written into the iteration directory:
+
+- `traffic_report_<iteration>.md`
+- `traffic_report_<iteration>.json`
+- `timeline_<iteration>.md`
+- `timeline_<iteration>.json`
+- `time_offsets_<iteration>.json` (diagnostics for the offset computation)
+
 ### Analyze all failed iterations from a MatterTest `summary.json`
 
 If you pass a `summary.json` (like the one produced by the stress/reliability harness),
@@ -68,8 +80,8 @@ python analyze_traffic.py \
 ```
 
 Notes:
-- This mode uses the report naming convention `traffic_report_iteration_<n>.md` inside
-    each iteration directory.
+- This mode uses the report naming convention `traffic_report_<n>.md` inside each iteration directory
+    (and also writes `traffic_report_<n>.json`).
 - In contrast, when you analyze a single iteration directory via `--iteration-dir`, the
     script always regenerates the report (it does not skip if one already exists).
 
@@ -81,6 +93,11 @@ python analyze_traffic.py \
     --dut-log examples/dut.log \
     --output traffic_report.md
 ```
+
+This produces both:
+
+- `traffic_report.md`
+- `traffic_report.json`
 
 ### With PCAP Files
 
@@ -169,6 +186,21 @@ python analyze_traffic.py \
     --output example_report.md
 ```
 
+## Timeline output (new)
+
+When running in iteration-dir mode or summary mode, the tool also generates a timeline:
+
+- `timeline_<iteration>.md`
+- `timeline_<iteration>.json`
+
+The timeline is organized by **exchange**, and within an exchange by **message counter** (one section per message counter).
+
+### Timestamp alignment behavior (B2 pragmatic)
+
+The analyzer chooses constant time offsets using robust statistics (medians) plus a small local search.
+If ordering invariants are violated (best-violation count is non-zero), it is **not fatal**: the timeline is still emitted, and a loud **Violations summary** section is included in the timeline MD/JSON.
+For deeper debugging, inspect `time_offsets_<iteration>.json`.
+
 ## Architecture
 
 The tool consists of several components:
@@ -187,7 +219,7 @@ The tool consists of several components:
 ## Requirements
 
 - Python 3.7 or higher
-- scapy (for PCAP parsing)
+- `tshark` (Wireshark CLI) for PCAP parsing/decryption
 
 ## License
 

@@ -8,10 +8,12 @@ a structured representation of network traffic between controller and device und
 
 import re
 import sys
+import json
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from pathlib import Path
+from statistics import median
 
 
 @dataclass
@@ -632,9 +634,679 @@ class ReportGenerator:
     """Generates markdown reports from correlated messages"""
 
     @staticmethod
+    def generate_report_json(messages: List[Message], output_file: str):
+        """Generate a machine-readable JSON traffic report."""
+
+        def le_to_dict(le: Optional[LogEntry]) -> Optional[Dict[str, Any]]:
+            if le is None:
+                return None
+            return {
+                "timestamp": le.timestamp,
+                "line_number": le.line_number,
+                "raw_line": le.raw_line,
+                "message_type": le.message_type,
+                "direction": le.direction,
+                "is_ack": le.is_ack,
+                "exchange_id": le.exchange_id,
+                "message_counter": le.message_counter,
+            }
+
+        def pkt_to_dict(pkt: PcapPacket) -> Dict[str, Any]:
+            return {
+                "packet_number": pkt.packet_number,
+                "timestamp": pkt.timestamp,
+                "src": pkt.src,
+                "dst": pkt.dst,
+                "protocol": pkt.protocol,
+                "info": pkt.info,
+            }
+
+        out_msgs: List[Dict[str, Any]] = []
+        for m in messages:
+            out_msgs.append(
+                {
+                    "message_id": m.message_id,
+                    "message_type": m.message_type,
+                    "exchange_id": m.exchange_id,
+                    "controller_message_ids": m.controller_message_ids or {},
+                    "dut_message_ids": m.dut_message_ids or {},
+                    "controller_pcap_by_message_id": {
+                        mid: [pkt_to_dict(p) for p in (pkts or [])]
+                        for mid, pkts in (m.controller_pcap_by_message_id or {}).items()
+                    },
+                    "dut_pcap_by_message_id": {
+                        mid: [pkt_to_dict(p) for p in (pkts or [])]
+                        for mid, pkts in (m.dut_pcap_by_message_id or {}).items()
+                    },
+                    "controller_sent": le_to_dict(m.controller_sent),
+                    "controller_received": le_to_dict(m.controller_received),
+                    "dut_sent": le_to_dict(m.dut_sent),
+                    "dut_received": le_to_dict(m.dut_received),
+                    "controller_ack_sent": le_to_dict(m.controller_ack_sent),
+                    "controller_ack_received": le_to_dict(m.controller_ack_received),
+                    "dut_ack_sent": le_to_dict(m.dut_ack_sent),
+                    "dut_ack_received": le_to_dict(m.dut_ack_received),
+                }
+            )
+
+        payload = {
+            "generated": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "version": 1,
+            "total_messages": len(messages),
+            "messages": out_msgs,
+        }
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+
+class TimestampNormalizer:
+    """Compute constant offsets and normalize all timestamps to controller-console time.
+
+    Pragmatic mode (B2): choose offsets via robust stats + local search, still emit
+    timeline, and surface any invariant violations loudly (not fatal).
+    """
+
+    @staticmethod
+    def _parse_console_ts(ts: str) -> Optional[float]:
+        if not ts:
+            return None
+        ts = ts.strip()
+        # Controller python logging: 2026-01-30 15:58:22,956
+        try:
+            if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.,]\d+", ts):
+                ts2 = ts.replace(',', '.')
+                dt = datetime.strptime(ts2, '%Y-%m-%d %H:%M:%S.%f')
+                return dt.timestamp()
+        except Exception:
+            pass
+
+        # DUT console: [1769806702.974]
+        m = re.match(r"^\[(\d+\.\d+)\]$", ts)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                return None
+
+        return None
+
+    @staticmethod
+    def _parse_pcap_ts(ts: str) -> Optional[float]:
+        if not ts or ts == "Invalid timestamp":
+            return None
+        try:
+            ts2 = ts.replace(',', '.')
+            dt = datetime.strptime(ts2, '%Y-%m-%d %H:%M:%S.%f')
+            return dt.timestamp()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _classify_direction_for_device(log_entry: LogEntry, *, device: str) -> str:
+        """Return 'outgoing' or 'incoming' relative to device."""
+        if device == 'controller':
+            return 'outgoing' if log_entry.direction == 'sent' else 'incoming'
+        if device == 'dut':
+            return 'outgoing' if log_entry.direction == 'sent' else 'incoming'
+        raise ValueError(f"unknown device: {device}")
+
+    @staticmethod
+    def _best_console_entry_for_mid(entries: List[LogEntry], *, device: str) -> Dict[str, LogEntry]:
+        """Pick one representative console log entry per message counter.
+
+        For A1 timeline granularity we still preserve all retries by keeping the raw
+        line lists elsewhere; here we just need a single anchor timestamp per mid.
+        """
+        by_mid: Dict[str, List[LogEntry]] = {}
+        for e in entries:
+            if not e.message_counter:
+                continue
+            ts = TimestampNormalizer._parse_console_ts(e.timestamp)
+            if ts is None:
+                continue
+            by_mid.setdefault(str(e.message_counter), []).append(e)
+
+        out: Dict[str, LogEntry] = {}
+        for mid, lst in by_mid.items():
+            # Prefer non-ACK message entries as anchors.
+            non_ack = [e for e in lst if not e.is_ack]
+            cand = non_ack or lst
+            # Prefer direction-consistent anchors:
+            # - outgoing => sent, incoming => received
+            # But if multiple exist (retries), pick earliest.
+            cand.sort(key=lambda e: TimestampNormalizer._parse_console_ts(e.timestamp) or 0.0)
+            out[mid] = cand[0]
+        return out
+
+    @staticmethod
+    def _best_pcap_packet_for_mid(mid_to_pkts: Dict[str, List[PcapPacket]]) -> Dict[str, PcapPacket]:
+        out: Dict[str, PcapPacket] = {}
+        for mid, pkts in (mid_to_pkts or {}).items():
+            good = [p for p in (pkts or []) if TimestampNormalizer._parse_pcap_ts(p.timestamp) is not None]
+            if not good:
+                continue
+            # Pick earliest packet timestamp as the anchor.
+            good.sort(key=lambda p: TimestampNormalizer._parse_pcap_ts(p.timestamp) or 0.0)
+            out[str(mid)] = good[0]
+        return out
+
+    @staticmethod
+    def _offset_candidates_console_minus_pcap(
+        *,
+        device: str,
+        console_by_mid: Dict[str, LogEntry],
+        pcap_by_mid: Dict[str, PcapPacket],
+    ) -> List[Tuple[str, float, str]]:
+        """Return list of (mid, diff, local_dir) where diff = console_ts - pcap_ts."""
+        out: List[Tuple[str, float, str]] = []
+        for mid, le in console_by_mid.items():
+            pkt = pcap_by_mid.get(mid)
+            if not pkt:
+                continue
+            cts = TimestampNormalizer._parse_console_ts(le.timestamp)
+            pts = TimestampNormalizer._parse_pcap_ts(pkt.timestamp)
+            if cts is None or pts is None:
+                continue
+            local_dir = TimestampNormalizer._classify_direction_for_device(le, device=device)
+            out.append((mid, cts - pts, local_dir))
+        return out
+
+    @staticmethod
+    def _count_console_pcap_violations(
+        *,
+        device: str,
+        console_by_mid: Dict[str, LogEntry],
+        pcap_by_mid: Dict[str, PcapPacket],
+        offset: float,
+    ) -> int:
+        violations = 0
+        for mid, le in console_by_mid.items():
+            pkt = pcap_by_mid.get(mid)
+            if not pkt:
+                continue
+            cts = TimestampNormalizer._parse_console_ts(le.timestamp)
+            pts = TimestampNormalizer._parse_pcap_ts(pkt.timestamp)
+            if cts is None or pts is None:
+                continue
+            pts_in_console = pts + offset
+            local_dir = TimestampNormalizer._classify_direction_for_device(le, device=device)
+            # Invariant from roadmap:
+            # incoming: pcap before console, outgoing: console before pcap
+            if local_dir == 'incoming':
+                if not (pts_in_console < cts):
+                    violations += 1
+            else:
+                if not (cts < pts_in_console):
+                    violations += 1
+        return violations
+
+    @staticmethod
+    def _compute_offset_console_to_pcap(
+        *,
+        device: str,
+        console_entries: List[LogEntry],
+        pcap_index: Dict[str, List[PcapPacket]],
+    ) -> Tuple[float, Dict[str, Any]]:
+        console_by_mid = TimestampNormalizer._best_console_entry_for_mid(console_entries, device=device)
+        pcap_by_mid = TimestampNormalizer._best_pcap_packet_for_mid(pcap_index)
+        cands = TimestampNormalizer._offset_candidates_console_minus_pcap(
+            device=device,
+            console_by_mid=console_by_mid,
+            pcap_by_mid=pcap_by_mid,
+        )
+
+        outgoing = [d for (_, d, local_dir) in cands if local_dir == 'outgoing']
+        incoming = [d for (_, d, local_dir) in cands if local_dir == 'incoming']
+        if len(outgoing) < 3 or len(incoming) < 3:
+            raise ValueError(
+                f"Not enough console<->pcap correspondences for {device}: "
+                f"outgoing={len(outgoing)} incoming={len(incoming)}"
+            )
+
+        med_out = median(outgoing)
+        med_in = median(incoming)
+        offset0 = (med_out + med_in) / 2.0
+
+        # Refinement search around offset0.
+        # Tight window: pcaps+console should be very close; we try +/- 2s in 1ms steps.
+        tried: List[Tuple[float, int]] = []
+        best_off = offset0
+        best_v = 10**18
+        step = 0.001
+        for i in range(-2000, 2001):
+            off = offset0 + i * step
+            v = TimestampNormalizer._count_console_pcap_violations(
+                device=device,
+                console_by_mid=console_by_mid,
+                pcap_by_mid=pcap_by_mid,
+                offset=off,
+            )
+            tried.append((off, v))
+            if v < best_v:
+                best_v = v
+                best_off = off
+                if best_v == 0:
+                    break
+
+        diag = {
+            "device": device,
+            "candidate_count": len(cands),
+            "outgoing_count": len(outgoing),
+            "incoming_count": len(incoming),
+            "median_out": med_out,
+            "median_in": med_in,
+            "offset0": offset0,
+            "best_offset": best_off,
+            "best_violations": best_v,
+            "tried": [{"offset": o, "violations": v} for (o, v) in tried[::50]] + ([] if len(tried) <= 1 else [{"offset": tried[-1][0], "violations": tried[-1][1]}]),
+        }
+
+        return best_off, diag
+
+    @staticmethod
+    def _compute_offset_controller_minus_dut(
+        *,
+        controller_entries: List[LogEntry],
+        dut_entries: List[LogEntry],
+    ) -> Tuple[float, Dict[str, Any]]:
+        """Compute offset to convert DUT console timestamps to controller-console timescale.
+
+        Returns offset such that: controller_ts ~= dut_ts + offset
+        """
+        c_by_mid = TimestampNormalizer._best_console_entry_for_mid(controller_entries, device='controller')
+        d_by_mid = TimestampNormalizer._best_console_entry_for_mid(dut_entries, device='dut')
+
+        diffs_c2d = []
+        diffs_d2c = []
+        pairs = []
+        for mid, c_le in c_by_mid.items():
+            d_le = d_by_mid.get(mid)
+            if not d_le:
+                continue
+            cts = TimestampNormalizer._parse_console_ts(c_le.timestamp)
+            dts = TimestampNormalizer._parse_console_ts(d_le.timestamp)
+            if cts is None or dts is None:
+                continue
+
+            # Determine direction based on controller log entry.
+            # controller sent => controller->dut; controller received => dut->controller
+            if c_le.direction == 'sent':
+                diffs_c2d.append(cts - dts)
+                pairs.append((mid, cts, dts, 'c2d'))
+            else:
+                diffs_d2c.append(cts - dts)
+                pairs.append((mid, cts, dts, 'd2c'))
+
+        if len(diffs_c2d) < 3 or len(diffs_d2c) < 3:
+            raise ValueError(
+                f"Not enough controller<->dut correspondences: c2d={len(diffs_c2d)} d2c={len(diffs_d2c)}"
+            )
+
+        med_c2d = median(diffs_c2d)
+        med_d2c = median(diffs_d2c)
+        offset0 = (med_c2d + med_d2c) / 2.0
+
+        # Search +/- 120s in 10ms steps (log clocks can be coarse).
+        tried: List[Tuple[float, int]] = []
+        best_off = offset0
+        best_v = 10**18
+        step = 0.01
+        for i in range(-12000, 12001):
+            off = offset0 + i * step
+            v = 0
+            for (_mid, cts, dts, kind) in pairs:
+                d_in_c = dts + off
+                if kind == 'c2d':
+                    if not (cts < d_in_c):
+                        v += 1
+                else:
+                    if not (d_in_c < cts):
+                        v += 1
+            tried.append((off, v))
+            if v < best_v:
+                best_v = v
+                best_off = off
+                if best_v == 0:
+                    break
+
+        diag = {
+            "median_c2d": med_c2d,
+            "median_d2c": med_d2c,
+            "offset0": offset0,
+            "best_offset": best_off,
+            "best_violations": best_v,
+            "tried": [{"offset": o, "violations": v} for (o, v) in tried[::200]] + ([] if len(tried) <= 1 else [{"offset": tried[-1][0], "violations": tried[-1][1]}]),
+        }
+
+        return best_off, diag
+
+
+class TimelineGenerator:
+    """Generate per-exchange per-message timeline artifacts (A1 granularity)."""
+
+    @staticmethod
+    def _fmt_ts(epoch: Optional[float]) -> str:
+        if epoch is None:
+            return ""
+        return datetime.fromtimestamp(epoch).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+    @staticmethod
+    def _controller_time_for_log(le: Optional[LogEntry], *, dut_to_controller_offset: float) -> Optional[float]:
+        if le is None:
+            return None
+        t = TimestampNormalizer._parse_console_ts(le.timestamp)
+        if t is None:
+            return None
+        # Controller logs are canonical already; DUT logs use [epoch] and must be shifted.
+        if le.timestamp.startswith('['):
+            return t + dut_to_controller_offset
+        return t
+
+    @staticmethod
+    def _controller_time_for_pcap(pkt: PcapPacket, *, pcap_to_controller_offset: float) -> Optional[float]:
+        t = TimestampNormalizer._parse_pcap_ts(pkt.timestamp)
+        if t is None:
+            return None
+        return t + pcap_to_controller_offset
+
+    @staticmethod
+    def generate_timeline(
+        *,
+        messages: List[Message],
+        iteration: str,
+        controller_logs: List[LogEntry],
+        dut_logs: List[LogEntry],
+        controller_pcap_index: Dict[str, List[PcapPacket]],
+        dut_pcap_index: Dict[str, List[PcapPacket]],
+        controller_pcap_to_controller_console_offset: float,
+        dut_pcap_to_dut_console_offset: float,
+        dut_console_to_controller_console_offset: float,
+        md_path: str,
+        json_path: str,
+        violations_summary: Optional[Dict[str, Any]] = None,
+    ):
+        # Offsets we actually apply for timeline rendering:
+        # controller pcap => controller console
+        c_pcap_to_ctrl = controller_pcap_to_controller_console_offset
+        # dut pcap => controller console (pcap->dut console then dut->controller)
+        d_pcap_to_ctrl = dut_pcap_to_dut_console_offset + dut_console_to_controller_console_offset
+
+        # Build fast maps from msg counter -> all related LogEntry lines (for retries/extra evidence).
+        c_by_mid: Dict[str, List[LogEntry]] = {}
+        d_by_mid: Dict[str, List[LogEntry]] = {}
+        for e in controller_logs:
+            if e.message_counter:
+                c_by_mid.setdefault(str(e.message_counter), []).append(e)
+        for e in dut_logs:
+            if e.message_counter:
+                d_by_mid.setdefault(str(e.message_counter), []).append(e)
+
+        for lst in c_by_mid.values():
+            lst.sort(key=lambda e: e.line_number)
+        for lst in d_by_mid.values():
+            lst.sort(key=lambda e: e.line_number)
+
+        timeline: Dict[str, Any] = {
+            "iteration": iteration,
+            "generated": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "timebase": "controller_console",
+            "offsets": {
+                "controller_pcap_to_controller_console": controller_pcap_to_controller_console_offset,
+                "dut_pcap_to_dut_console": dut_pcap_to_dut_console_offset,
+                "dut_console_to_controller_console": dut_console_to_controller_console_offset,
+            },
+            "violations_summary": violations_summary or {},
+            "exchanges": [],
+        }
+
+        # Markdown header
+        with open(md_path, 'w', encoding='utf-8') as f:
+            f.write(f"# Timeline (iteration {iteration})\n\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write("All timestamps have been normalized to controller-console time.\n\n")
+
+            if violations_summary:
+                f.write("## Violations summary (VERY IMPORTANT)\n\n")
+                f.write(
+                    "Timestamp alignment uses constant offsets. Any ordering invariant violations below mean "
+                    "the chosen offsets don't perfectly explain the observed ordering (could be clock drift, "
+                    "missing evidence, or imperfect correspondence selection). The timeline is still emitted "
+                    "to support debugging.\n\n"
+                )
+                f.write("| Offset stage | Best violations | Notes |\n")
+                f.write("|-------------|-----------------|-------|\n")
+
+                def row(stage: str, v: Any, notes: str):
+                    f.write(f"| {stage} | {v} | {notes} |\n")
+
+                row(
+                    "controller console ↔ controller pcap",
+                    violations_summary.get("controller_console_to_pcap", {}).get("best_violations", ""),
+                    "Expected: 0",
+                )
+                row(
+                    "dut console ↔ dut pcap",
+                    violations_summary.get("dut_console_to_pcap", {}).get("best_violations", ""),
+                    "Expected: 0",
+                )
+                row(
+                    "controller console ↔ dut console",
+                    violations_summary.get("controller_vs_dut", {}).get("best_violations", ""),
+                    "Expected: 0",
+                )
+
+                f.write("\nIf these are non-zero, inspect the per-try details in the corresponding `time_offsets_<iteration>.json`.\n\n")
+
+            # Group messages by exchange id
+            by_ex: Dict[str, List[Message]] = {}
+            for m in messages:
+                ex = m.exchange_id or "unknown"
+                by_ex.setdefault(str(ex), []).append(m)
+
+            def ex_first_ts(ex_msgs: List[Message]) -> float:
+                # Find earliest anchor in controller time from any entry in the exchange.
+                best = None
+                for mm in ex_msgs:
+                    for le in [mm.controller_sent, mm.controller_received, mm.dut_sent, mm.dut_received]:
+                        t = TimelineGenerator._controller_time_for_log(
+                            le,
+                            dut_to_controller_offset=dut_console_to_controller_console_offset,
+                        )
+                        if t is None:
+                            continue
+                        best = t if best is None else min(best, t)
+                return best if best is not None else 0.0
+
+            # Stable ordering by first timestamp.
+            for ex_id, ex_msgs in sorted(by_ex.items(), key=lambda kv: ex_first_ts(kv[1])):
+                ex_section: Dict[str, Any] = {"exchange_id": ex_id, "messages": []}
+
+                # Title: based on earliest non-ack message type in this exchange.
+                title = None
+                for mm in ex_msgs:
+                    if mm.message_type and mm.message_type != 'Unknown':
+                        title = mm.message_type
+                        break
+                if not title:
+                    title = "interaction"
+
+                start_ts = ex_first_ts(ex_msgs)
+                f.write(f"## Exchange {ex_id} — {title} [{TimelineGenerator._fmt_ts(start_ts)}]\n\n")
+
+                # Build per-message timeline entries.
+                # A1: one section per message counter, but we may not have one Message object per counter.
+                # We'll enumerate counters seen in either side logs within this exchange.
+                ex_mids = set()
+                for mm in ex_msgs:
+                    ex_mids.update((mm.controller_message_ids or {}).keys())
+                    ex_mids.update((mm.dut_message_ids or {}).keys())
+                mids_sorted = sorted(ex_mids, key=lambda x: int(x) if str(x).isdigit() else str(x))
+
+                idx = 1
+                for mid in mids_sorted:
+                    # Determine direction and type from best available log entry.
+                    c_lines = c_by_mid.get(mid, [])
+                    d_lines = d_by_mid.get(mid, [])
+                    anchor = None
+                    for cand in c_lines + d_lines:
+                        if cand.exchange_id != ex_id:
+                            continue
+                        if not cand.is_ack:
+                            anchor = cand
+                            break
+                    if anchor is None:
+                        # fallback to any line in this exchange
+                        for cand in c_lines + d_lines:
+                            if cand.exchange_id == ex_id:
+                                anchor = cand
+                                break
+
+                    direction = None
+                    mtype = None
+                    if anchor is not None:
+                        # Infer Cont/DUT perspective from which list contains the anchor
+                        if anchor in c_lines:
+                            direction = 'Cont → DUT' if anchor.direction == 'sent' else 'DUT → Cont'
+                        else:
+                            direction = 'DUT → Cont' if anchor.direction == 'sent' else 'Cont → DUT'
+                        mtype = anchor.message_type
+                    else:
+                        direction = ""
+                        mtype = ""
+
+                    # Timestamp for heading: use earliest evidence timestamp in controller time.
+                    evidence_ts = []
+                    for le in (c_lines + d_lines):
+                        if le.exchange_id != ex_id:
+                            continue
+                        t = TimelineGenerator._controller_time_for_log(le, dut_to_controller_offset=dut_console_to_controller_console_offset)
+                        if t is not None:
+                            evidence_ts.append(t)
+                    for pkt in (controller_pcap_index.get(mid, []) or []):
+                        t = TimelineGenerator._controller_time_for_pcap(pkt, pcap_to_controller_offset=c_pcap_to_ctrl)
+                        if t is not None:
+                            evidence_ts.append(t)
+                    for pkt in (dut_pcap_index.get(mid, []) or []):
+                        t = TimelineGenerator._controller_time_for_pcap(pkt, pcap_to_controller_offset=d_pcap_to_ctrl)
+                        if t is not None:
+                            evidence_ts.append(t)
+
+                    head_ts = min(evidence_ts) if evidence_ts else None
+                    f.write(f"### {idx}) {direction}: {mtype or 'Message'} (message {mid})\n\n")
+                    if direction:
+                        f.write(f"- **Direction:** {direction}\n")
+                    if mtype:
+                        f.write(f"- **Type:** `{mtype}`\n")
+                    f.write(f"- **Message:** `M:{mid}`\n")
+                    if head_ts is not None:
+                        f.write(f"- **Timestamp:** [{TimelineGenerator._fmt_ts(head_ts)}]\n")
+
+                    # Evidence lists
+                    def write_log_block(label: str, lines: List[LogEntry], is_dut: bool):
+                        rel = [e for e in lines if e.exchange_id == ex_id]
+                        if not rel:
+                            return
+                        rel.sort(key=lambda e: e.line_number)
+                        t0 = TimelineGenerator._controller_time_for_log(rel[0], dut_to_controller_offset=dut_console_to_controller_console_offset)
+                        f.write(f"- **{label}** [{TimelineGenerator._fmt_ts(t0)}] `{rel[0].raw_line}`\n")
+                        for extra in rel[1:]:
+                            tt = TimelineGenerator._controller_time_for_log(extra, dut_to_controller_offset=dut_console_to_controller_console_offset)
+                            f.write(f"    - [{TimelineGenerator._fmt_ts(tt)}] `{extra.raw_line}`\n")
+
+                    write_log_block("Cont log", c_lines, is_dut=False)
+
+                    def write_pcap_block(label: str, pkts: List[PcapPacket], offset_to_ctrl: float):
+                        if not pkts:
+                            return
+                        good = [p for p in pkts if TimestampNormalizer._parse_pcap_ts(p.timestamp) is not None]
+                        if not good:
+                            return
+                        good.sort(key=lambda p: p.packet_number)
+                        t0 = TimelineGenerator._controller_time_for_pcap(good[0], pcap_to_controller_offset=offset_to_ctrl)
+                        f.write(f"- **{label}** [{TimelineGenerator._fmt_ts(t0)}] `{good[0].src} → {good[0].dst} {good[0].protocol} {good[0].info}`\n")
+                        for extra in good[1:]:
+                            tt = TimelineGenerator._controller_time_for_pcap(extra, pcap_to_controller_offset=offset_to_ctrl)
+                            f.write(f"    - [{TimelineGenerator._fmt_ts(tt)}] `{extra.src} → {extra.dst} {extra.protocol} {extra.info}`\n")
+
+                    write_pcap_block("Cont pcap", controller_pcap_index.get(mid, []) or [], c_pcap_to_ctrl)
+                    write_pcap_block("DUT pcap", dut_pcap_index.get(mid, []) or [], d_pcap_to_ctrl)
+                    write_log_block("DUT log", d_lines, is_dut=True)
+
+                    f.write("\n")
+
+                    ex_section["messages"].append(
+                        {
+                            "index": idx,
+                            "message_counter": mid,
+                            "exchange_id": ex_id,
+                            "direction": direction,
+                            "type": mtype,
+                            "timestamp_controller": TimelineGenerator._fmt_ts(head_ts) if head_ts is not None else None,
+                            "evidence": {
+                                "controller_log": [
+                                    {
+                                        "timestamp_controller": TimelineGenerator._fmt_ts(
+                                            TimelineGenerator._controller_time_for_log(e, dut_to_controller_offset=dut_console_to_controller_console_offset)
+                                        ),
+                                        "line_number": e.line_number,
+                                        "raw_line": e.raw_line,
+                                    }
+                                    for e in [e for e in c_lines if e.exchange_id == ex_id]
+                                ],
+                                "dut_log": [
+                                    {
+                                        "timestamp_controller": TimelineGenerator._fmt_ts(
+                                            TimelineGenerator._controller_time_for_log(e, dut_to_controller_offset=dut_console_to_controller_console_offset)
+                                        ),
+                                        "line_number": e.line_number,
+                                        "raw_line": e.raw_line,
+                                    }
+                                    for e in [e for e in d_lines if e.exchange_id == ex_id]
+                                ],
+                                "controller_pcap": [
+                                    {
+                                        "timestamp_controller": TimelineGenerator._fmt_ts(
+                                            TimelineGenerator._controller_time_for_pcap(p, pcap_to_controller_offset=c_pcap_to_ctrl)
+                                        ),
+                                        "packet_number": p.packet_number,
+                                        "src": p.src,
+                                        "dst": p.dst,
+                                        "protocol": p.protocol,
+                                        "info": p.info,
+                                    }
+                                    for p in (controller_pcap_index.get(mid, []) or [])
+                                ],
+                                "dut_pcap": [
+                                    {
+                                        "timestamp_controller": TimelineGenerator._fmt_ts(
+                                            TimelineGenerator._controller_time_for_pcap(p, pcap_to_controller_offset=d_pcap_to_ctrl)
+                                        ),
+                                        "packet_number": p.packet_number,
+                                        "src": p.src,
+                                        "dst": p.dst,
+                                        "protocol": p.protocol,
+                                        "info": p.info,
+                                    }
+                                    for p in (dut_pcap_index.get(mid, []) or [])
+                                ],
+                            },
+                        }
+                    )
+
+                    idx += 1
+
+                timeline["exchanges"].append(ex_section)
+
+        with open(json_path, 'w', encoding='utf-8') as jf:
+            json.dump(timeline, jf, indent=2, sort_keys=True)
+
+
+class ReportGenerator(ReportGenerator):
+    @staticmethod
     def generate_report(messages: List[Message], output_file: str):
         """Generate a markdown report"""
-        
+
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write("# Matter Traffic Analysis Report\n\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
@@ -643,7 +1315,7 @@ class ReportGenerator:
             ReportGenerator._write_visibility_summary(f, messages)
 
             f.write("---\n\n")
-            
+
             for message in messages:
                 ReportGenerator._write_message_section(f, message)
 
@@ -879,7 +1551,6 @@ def main():
     """Main entry point"""
     import argparse
     import os
-    import json
     
     parser = argparse.ArgumentParser(
         description=(
@@ -998,7 +1669,7 @@ def main():
         output = args.output
         if not output:
             # Put the report next to the iteration data, stable name.
-            output = str(p / f"traffic_report_iteration_{iteration}.md")
+            output = str(p / f"traffic_report_{iteration}.md")
 
         return {
             "iteration": iteration,
@@ -1058,9 +1729,13 @@ def main():
             )
             return 2
 
-        output_path = Path(detected_local['output'])
-        if allow_skip_if_report_exists and output_path.exists() and not args.force:
-            print(f"Skipping (report exists): {output_path}")
+        output_md_path = Path(detected_local['output'])
+        output_json_path = output_md_path.with_suffix('.json')
+        timeline_md_path = output_md_path.parent / f"timeline_{detected_local['iteration']}.md"
+        timeline_json_path = output_md_path.parent / f"timeline_{detected_local['iteration']}.json"
+
+        if allow_skip_if_report_exists and output_md_path.exists() and output_json_path.exists() and not args.force:
+            print(f"Skipping (reports exist): {output_md_path} and {output_json_path}")
             return 0
 
         print("Matter Traffic Analyzer")
@@ -1071,7 +1746,10 @@ def main():
         print(f"DUT log: {dut_log}")
         print(f"Controller PCAP: {detected_local['controller_pcap'] or 'N/A'}")
         print(f"DUT PCAP: {detected_local['dut_pcap'] or 'N/A'}")
-        print(f"Output file: {detected_local['output']}")
+        print(f"Traffic report (md): {output_md_path}")
+        print(f"Traffic report (json): {output_json_path}")
+        print(f"Timeline (md): {timeline_md_path}")
+        print(f"Timeline (json): {timeline_json_path}")
         print("=" * 50)
 
         # Parse logs
@@ -1120,9 +1798,76 @@ def main():
                     m.dut_pcap_by_message_id[mid] = dut_pcap_index[mid]
         print(f"Identified {len(messages)} messages")
 
-        # Generate report
-        print(f"\nGenerating report: {detected_local['output']}")
-        ReportGenerator.generate_report(messages, detected_local['output'])
+        # Compute time offsets and write timeline (B2 pragmatic): always emit timeline,
+        # but surface any invariant violations loudly.
+        print("\nComputing time offsets (pragmatic)...")
+        c_pcap_to_c_console, diag1 = TimestampNormalizer._compute_offset_console_to_pcap(
+            device='controller',
+            console_entries=controller_logs,
+            pcap_index=controller_pcap_index,
+        )
+        d_pcap_to_d_console, diag2 = TimestampNormalizer._compute_offset_console_to_pcap(
+            device='dut',
+            console_entries=dut_logs,
+            pcap_index=dut_pcap_index,
+        )
+        d_console_to_c_console, diag3 = TimestampNormalizer._compute_offset_controller_minus_dut(
+            controller_entries=controller_logs,
+            dut_entries=dut_logs,
+        )
+        _offset_diag_path = output_md_path.parent / f"time_offsets_{detected_local['iteration']}.json"
+        with open(_offset_diag_path, 'w', encoding='utf-8') as df:
+            json.dump(
+                {
+                    "controller_console_to_controller_pcap": c_pcap_to_c_console,
+                    "dut_console_to_dut_pcap": d_pcap_to_d_console,
+                    "dut_console_to_controller_console": d_console_to_c_console,
+                    "diags": {
+                        "controller_console_to_pcap": diag1,
+                        "dut_console_to_pcap": diag2,
+                        "controller_vs_dut": diag3,
+                    },
+                },
+                df,
+                indent=2,
+                sort_keys=True,
+            )
+
+        print("Generating timeline...")
+        TimelineGenerator.generate_timeline(
+            messages=messages,
+            iteration=detected_local['iteration'],
+            controller_logs=controller_logs,
+            dut_logs=dut_logs,
+            controller_pcap_index=controller_pcap_index,
+            dut_pcap_index=dut_pcap_index,
+            controller_pcap_to_controller_console_offset=c_pcap_to_c_console,
+            dut_pcap_to_dut_console_offset=d_pcap_to_d_console,
+            dut_console_to_controller_console_offset=d_console_to_c_console,
+            md_path=str(timeline_md_path),
+            json_path=str(timeline_json_path),
+            violations_summary={
+                "controller_console_to_pcap": {
+                    "best_offset": diag1.get("best_offset"),
+                    "best_violations": diag1.get("best_violations"),
+                },
+                "dut_console_to_pcap": {
+                    "best_offset": diag2.get("best_offset"),
+                    "best_violations": diag2.get("best_violations"),
+                },
+                "controller_vs_dut": {
+                    "best_offset": diag3.get("best_offset"),
+                    "best_violations": diag3.get("best_violations"),
+                },
+                "b2_mode": "pragmatic",
+            },
+        )
+
+        # Generate traffic report (md + json)
+        print(f"\nGenerating traffic report (md): {output_md_path}")
+        ReportGenerator.generate_report(messages, str(output_md_path))
+        print(f"Generating traffic report (json): {output_json_path}")
+        ReportGenerator.generate_report_json(messages, str(output_json_path))
         print("\nAnalysis complete!")
         return 0
 
@@ -1168,7 +1913,8 @@ def main():
     print(f"DUT log: {args.dut_log}")
     print(f"Controller PCAP: {args.controller_pcap or 'N/A'}")
     print(f"DUT PCAP: {args.dut_pcap or 'N/A'}")
-    print(f"Output file: {args.output}")
+    print(f"Traffic report (md): {args.output}")
+    print(f"Traffic report (json): {Path(args.output).with_suffix('.json')}")
     print("=" * 50)
 
     print("\nParsing controller log...")
@@ -1212,8 +1958,12 @@ def main():
                 m.dut_pcap_by_message_id[mid] = dut_pcap_index[mid]
     print(f"Identified {len(messages)} messages")
 
-    print(f"\nGenerating report: {args.output}")
+    # In manual mode we don't know iteration id; only emit traffic report artifacts.
+    print(f"\nGenerating traffic report (md): {args.output}")
     ReportGenerator.generate_report(messages, args.output)
+    json_out = str(Path(args.output).with_suffix('.json'))
+    print(f"Generating traffic report (json): {json_out}")
+    ReportGenerator.generate_report_json(messages, json_out)
     print("\nAnalysis complete!")
     return 0
 
