@@ -33,6 +33,46 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Analyze a MatterTest iteration directory (auto-detect inputs)
+
+If your logs are stored as per-iteration folders (integer directory names) containing
+timestamped filenames (for example: `controller_log_iteration_208_...`), you can point
+the analyzer at the iteration directory and it will auto-detect the log/pcap files.
+
+The generated report filename will include the iteration number but **not** a timestamp.
+
+```bash
+python analyze_traffic.py \
+    --iteration-dir logs/MatterTest/ble-wifi/<timestamp>/<testcase>/<iteration>/
+```
+
+### Analyze all failed iterations from a MatterTest `summary.json`
+
+If you pass a `summary.json` (like the one produced by the stress/reliability harness),
+the script will read `test_summary_record.list_of_iterations_failed` and generate a
+per-iteration report for **each failed iteration**.
+
+In this mode, it will **skip** work for an iteration if the expected report filename
+already exists in that iteration directory, unless you pass `--force`.
+
+```bash
+python analyze_traffic.py logs/MatterTest/ble-wifi/<timestamp>/<testcase>/summary.json
+```
+
+Force regeneration of all failed-iteration reports:
+
+```bash
+python analyze_traffic.py \
+        --force \
+        logs/MatterTest/ble-wifi/<timestamp>/<testcase>/summary.json
+```
+
+Notes:
+- This mode uses the report naming convention `traffic_report_iteration_<n>.md` inside
+    each iteration directory.
+- In contrast, when you analyze a single iteration directory via `--iteration-dir`, the
+    script always regenerates the report (it does not skip if one already exists).
+
 ### Basic Usage (Logs Only)
 
 ```bash
@@ -60,6 +100,7 @@ python analyze_traffic.py \
 - `--controller-pcap`: Path to the controller PCAP file (optional)
 - `--dut-pcap`: Path to the DUT PCAP file (optional)
 - `--output`: Output markdown file path (default: traffic_analysis.md)
+- `--force`: Summary mode only: regenerate per-iteration reports even if they already exist
 
 ## Log Format
 

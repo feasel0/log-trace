@@ -44,3 +44,6 @@ traffic_analysis.md
 # PCAP files (uncomment if you don't want to track them)
 # *.pcap
 # *.pcapng
+
+# Note: in this repo, `logs` may be a symlink; `logs/` won't ignore the symlink itself.
+logs
